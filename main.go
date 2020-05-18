@@ -26,7 +26,7 @@ func QrGenerator(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s, err := url.QueryUnescape(data)
+	s, err := url.PathUnescape(data)
 	if err != nil {
 		http.Error(w, "", http.StatusBadRequest)
 		return
