@@ -2,69 +2,143 @@ package main
 
 import (
 	"bytes"
-	"github.com/boombuler/barcode"
-	"github.com/boombuler/barcode/qr"
+	"fmt"
+	"image"
+	"image/draw"
 	"image/png"
-	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
+
+	"github.com/nfnt/resize"
+	"github.com/skip2/go-qrcode"
+	"github.com/ysv/pkg/httputil/handler"
+	"github.com/ysv/pkg/logger"
+)
+
+const(
+	LogoSize = 150
+	GeneratedQRImageSize = 500
+
+	DataMaxLength = 256
+
+	ImageMinSize     = 100
+	ImageMaxSize     = 1000
+	DefaultImageSize = 250
 )
 
 func main() {
-	http.HandleFunc("/", QrGenerator)
-	err := http.ListenAndServe(":8080", nil)
-	if err != nil {
-		log.Fatal("ListenAndServe: ", err)
+	var generator qrGenerator
+
+	logoURL, ok := os.LookupEnv("LOGO_URL")
+	if ok {
+		logo, err := loadPNGImage(logoURL)
+		if err != nil {
+			logger.Fatalf("Failed to load logo from: %v", logoURL)
+		}
+		logo = resize.Resize(LogoSize, LogoSize, logo, resize.Lanczos3)
+		generator.logo = &logo
+	}
+
+	srv := server{qrGenerator: &generator}
+
+	http.Handle("/", srv.qrGenerateHandler())
+
+	addr := ":8080"
+	logger.Warnf("listening on %v...", addr)
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		logger.Fatalf("http server failed: %v", err)
 	}
 }
 
-func QrGenerator(w http.ResponseWriter, r *http.Request) {
-	data := r.URL.Query().Get("data")
-	if data == "" {
-		http.Error(w, "", http.StatusBadRequest)
-		return
-	}
+type server struct {
+	qrGenerator *qrGenerator
+}
 
-	s, err := url.PathUnescape(data)
+func loadPNGImage(logoURL string) (image.Image, error) {
+	resp, err := http.Get(logoURL)
 	if err != nil {
-		http.Error(w, "", http.StatusBadRequest)
-		return
+		return nil, err
 	}
 
-	code, err := qr.Encode(s, qr.L, qr.Auto)
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("failed to load logo. status: %v", resp.StatusCode)
+	}
+
+	pngImage, _, err := image.Decode(resp.Body)
 	if err != nil {
-		http.Error(w, "", http.StatusInternalServerError)
-		return
+		return nil, err
 	}
 
-	size := r.URL.Query().Get("size")
-	if size == "" {
-		size = "250"
+	return pngImage, nil
+}
+
+func (s *server) qrGenerateHandler() handler.Handler {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		rawData := r.URL.Query().Get("data")
+		if rawData == "" {
+			return handler.NewAPIError(422, "data.missing")
+		} else if len(rawData) > DataMaxLength {
+			return handler.NewAPIError(422, "data.too_long")
+		}
+
+		qrData, err := url.PathUnescape(rawData)
+		if err != nil {
+			return err
+		}
+
+		size, err := strconv.ParseUint(r.URL.Query().Get("size"), 10, 64)
+		if err != nil {
+			size = DefaultImageSize
+		} else if size > ImageMaxSize {
+			return handler.NewAPIError(422, "size.too_big")
+		} else if size < ImageMinSize {
+			return handler.NewAPIError(422, "size.too_small")
+		}
+
+		qrCode, err := s.qrGenerator.Generate(qrData, uint(size))
+		if err != nil {
+			return err
+		}
+
+		buffer := new(bytes.Buffer)
+		if err := png.Encode(buffer, qrCode); err != nil {
+			return err
+		}
+
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Content-Length", strconv.Itoa(len(buffer.Bytes())))
+
+		if _, err := w.Write(buffer.Bytes()); err != nil {
+			return err
+		}
+		return nil
 	}
-	intsize, err := strconv.Atoi(size)
+}
+
+type qrGenerator struct {
+	logo *image.Image
+}
+
+func (gen *qrGenerator) Generate(data string, size uint) (image.Image,error) {
+	code, err := qrcode.New(data, qrcode.Highest)
 	if err != nil {
-		intsize = 250
+		return nil, err
 	}
 
-	// Scale the barcode to the appropriate size
-	code, err = barcode.Scale(code, intsize, intsize)
-	if err != nil {
-		http.Error(w, "", http.StatusInternalServerError)
-		return
+	qrWithoutLogo := code.Image(GeneratedQRImageSize)
+	if gen.logo == nil {
+		return resize.Resize(size, size, qrWithoutLogo, resize.Lanczos3), nil
 	}
 
-	buffer := new(bytes.Buffer)
-	if err := png.Encode(buffer, code); err != nil {
-		http.Error(w, "", http.StatusInternalServerError)
-		return
-	}
+	qrWithLogo := image.NewRGBA(qrWithoutLogo.Bounds())
 
-	w.Header().Set("Content-Type", "image/png")
-	w.Header().Set("Content-Length", strconv.Itoa(len(buffer.Bytes())))
+	logoPosition0 := GeneratedQRImageSize / 2 - LogoSize / 2
+	logoPosition1 := logoPosition0 + LogoSize
 
-	if _, err := w.Write(buffer.Bytes()); err != nil {
-		http.Error(w, "", http.StatusInternalServerError)
-		return
-	}
+	draw.Draw(qrWithLogo, qrWithoutLogo.Bounds(), qrWithoutLogo, image.Point{}, draw.Src)
+	draw.Draw(qrWithLogo, image.Rect(logoPosition0, logoPosition0, logoPosition1, logoPosition1), *gen.logo, image.Point{}, draw.Over)
+
+	return resize.Resize(size, size, qrWithLogo, resize.Lanczos3), nil
 }
